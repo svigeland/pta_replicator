@@ -112,7 +112,7 @@ class SimulatedPulsar:
         """
         return Pulsar(self.toas, self.model, ephem=ephem, timing_package='pint')
     
-    def generate_daily_avg_toas(self, ideal=False):
+    def generate_daily_avg_toas(self, ideal=False, inf_freq=False):
         """
         Compute daily averaged TOAs
         """
@@ -132,7 +132,7 @@ class SimulatedPulsar:
             print('Filtering out {0} TOAs with flag {1} observed with {2}...'.format(len(mytoas), f,
                                                                                  mytoas['obs'][0]))
             myresiduals = np.zeros(len(mytoas))
-    
+
             # get scaled errors
             err = self.model.scale_toa_sigma(mytoas).to(u.s).value
 
@@ -140,17 +140,54 @@ class SimulatedPulsar:
             U, ecorrvec = self.model.ecorr_basis_weight_pair(mytoas)
             ecorr = np.dot(U*ecorrvec, np.ones(U.shape[1]))
 
-            avetoas, aveerr, averes = compute_daily_ave(mytoas.get_mjds().to(u.s).value,
-                                                    myresiduals, err, ecorr=ecorr, dt=2*secperhr)
+            avetoas, aveerr, averes, freqs = compute_daily_ave(mytoas.get_mjds().to(u.s).value,
+                                                               myresiduals, err, ecorr=ecorr,
+                                                               dt=2*secperhr, flags=mytoas['freq'])
 
+            if inf_freq:
+            
+                par = getattr(self.model.components['DispersionDM'], 'DM')
+                
+                mjds = (avetoas*u.s).to(u.d)
+                dmx = np.array([get_DMX_value(self.model.components['DispersionDMX'], mjd) for mjd in mjds])
+
+                dm = np.array([(par.quantity + d.quantity).to(u.pc/u.cm**3).value for d in dmx])
+                
+                if par.uncertainty is None:
+                    dmerr = np.array([d.uncertainty.to(u.pc/u.cm**3).value for d in dmx])
+                else:
+                    dmerr = np.array([np.sqrt(par.uncertainty**2 + d.uncertainty**2).to(u.pc/u.cm**3).value for d in dmx])
+
+                k = 4.148808*u.ms
+                Deltat = (k*(freqs*u.MHz/u.GHz)**(-2) * dm).to(u.d).value
+                dmtoaerr = (k*(freqs*u.MHz/u.GHz)**(-2) * dmerr).to(u.s).value
+                
+                if type(dmtoaerr[0]) is not np.float64:
+                    dmtoaerr = np.array([float(d) for d in dmtoaerr])
+                
             if toas2 is None:
-                toas2 = toa.get_TOAs_array(avetoas/secperday, obs=mytoas['obs'][0],
-                                           flags={'f': flags[0]}, freqs=np.median(mytoas['freq']),
-                                           errors=aveerr*1e6, planets=True, ephem='DE440')
+
+                if inf_freq:
+                    toas2 = toa.get_TOAs_array(avetoas/secperday-Deltat, obs=mytoas['obs'][0],
+                                               flags={'f': flags[0]},
+                                               errors=np.sqrt(aveerr**2 + dmtoaerr**2)*1e6,
+                                               planets=True, ephem='DE440')
+                else:
+                    toas2 = toa.get_TOAs_array(avetoas/secperday, obs=mytoas['obs'][0],
+                                               flags={'f': flags[0]}, freqs=freqs,
+                                               errors=aveerr*1e6, planets=True, ephem='DE440')
             else:
-                toas2.merge(toa.get_TOAs_array(avetoas/secperday, obs=mytoas['obs'][0],
-                                               flags={'f': f}, freqs=np.median(mytoas['freq']),
-                                               errors=aveerr*1e6, planets=True, ephem='DE440'))
+                
+                if inf_freq:
+                    toas2.merge(toa.get_TOAs_array(avetoas/secperday-Deltat, obs=mytoas['obs'][0],
+                                                   flags={'f': flags[0]},
+                                                   errors=np.sqrt(aveerr**2 + dmtoaerr**2)*1e6,
+                                                   planets=True, ephem='DE440'))
+                else:
+                    toas2.merge(toa.get_TOAs_array(avetoas/secperday, obs=mytoas['obs'][0],
+                                                   flags={'f': f}, freqs=freqs,
+                                                   errors=aveerr*1e6, planets=True, ephem='DE440'))
+
             res2 = np.append(res2, averes)
 
         self.toas = toas2
@@ -181,14 +218,14 @@ class SimulatedPulsar:
             if len(self.model.components[name].params) == 0:
                 self.model.remove_component(name)
 
-        # remove DMX and troposphere delay
-#        if 'DispersionDMX' in component_names:
-#            self.model.remove_component('DispersionDMX')
-        if 'TroposphereDelay' in component_names:
-            self.model.remove_component('TroposphereDelay')
-        if 'FD' in component_names:
-            self.model.remove_component('FD')
-        
+        # if using infinite frequency TOAs, remove DM and DMX from the timing model
+        # also remove solar wind dispersion if it is there
+        if inf_freq:
+            self.model.remove_component('DispersionDMX')
+            self.model.remove_component('DispersionDM')
+            if 'SolarWindDispersion' in self.model.components:
+                self.model.remove_component('SolarWindDispersion')
+
         # update residuals
         if ideal:
             make_ideal(self)
@@ -355,3 +392,40 @@ def compute_daily_ave(times, res, err, ecorr=None, dt=1.0, flags=None):
         return avetoas, aveerr, averes, aveflags
     else:
         return avetoas, aveerr, averes
+
+
+def get_DMX_value(dmx_model, mjd):
+    
+    params_DMX = []
+    params_DMXR1 = []
+    params_DMXR2 = []
+
+    for p in dmx_model.params:
+        if 'R1' in p:
+            params_DMXR1.append(p)
+        elif 'R2' in p:
+            params_DMXR2.append(p)
+        elif '_' in p:
+            params_DMX.append(p)
+            
+    imax = len(params_DMX)
+    i = 0
+    
+    if mjd.value > getattr(dmx_model, params_DMXR2[imax-1]).value:
+        return getattr(dmx_model, params_DMX[imax-1])
+    elif mjd.value < getattr(dmx_model, params_DMXR1[0]).value:
+        return getattr(dmx_model, params_DMX[0])
+    else:
+
+        while i >= 0:
+            if i >= imax:
+                return getattr(dmx_model, params_DMX[imax-1])
+                i = -1
+            elif mjd.value > getattr(dmx_model, params_DMXR1[i]).value and mjd.value < getattr(dmx_model, params_DMXR2[i]).value:
+                return getattr(dmx_model, params_DMX[i])
+                i = -1
+            elif mjd.value < getattr(dmx_model, params_DMXR1[i]).value:
+                return getattr(dmx_model, params_DMX[i-1])
+                i = -1
+            else:
+                i += 1
